@@ -1,23 +1,17 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-#define HTU21
 #define MEASURE_TEMPERATURE
 //#define MEASURE_HUMIDITY
 #define MEASURE_BATTERY // check voltage on analog pin. immediately go to sleep if voltage is <= 3.0V
-//#define SERIAL_DEBUG // enable serial debug output and LED blinking
+#define SERIAL_DEBUG // enable serial debug output and LED blinking
 //#define SLOW_UPDATE
 // https://www.element14.com/community/people/neilk/blog/2019/02/14/investigating-the-power-consumption-of-a-wemos-d1-mini-esp8266
 #define LED_PIN     D4
 #define LED2_PIN    D6
 
-#ifdef SHT31
 #include <Adafruit_SHT31.h>
-#endif
-
-#ifdef HTU21
 #include <Adafruit_HTU21DF.h>
-#endif
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
@@ -48,24 +42,25 @@ struct {
   uint32_t crc32;
 
   uint32_t dummydata;
+  uint32_t sensorType;
   uint32_t numStarts; // counts the number of starts
   uint32_t lastUpdate; // contains the start number when the last update was sent
   float temperature; // contains the temperature that was sent at the last update
   float humidity; // contains the humidity that was sent at the last update
   float voltage; // contains the voltage that was sent at the last update
-  byte data[512 - 6*8]; // nothing yet
+  byte data[512 - 8*4]; // nothing yet
 } rtcData;
 
 float temperature;
 float humidity;
 float voltage;
 
-#ifdef SLOW_UPDAATE
+#ifdef SLOW_UPDATE
 const unsigned int updateInterval = 7200; // in seconds (2 hours)
 const unsigned int maxUpdateInterval = 12; // if value does not change, update at least every x's time (24 hours)
 const float minTemperatureDifference = 1; // only update server if newTemp > oldTemp +- diff
 const float minHumidityDifference = 5;
-const float minVoltageDifference = 0.2;
+const float minVoltageDifference = 0.1;
 #else
 const unsigned int updateInterval = 300; // in seconds (5 minutes)
 const unsigned int maxUpdateInterval = 72; // if value does not change, update at least every x's time (6 hours)
@@ -80,6 +75,12 @@ typedef enum {
     HUMIDITY,
     VOLTAGE
 } datatype;
+
+typedef enum {
+    NONE = 0,
+    SHT31,
+    HTU21
+} sensortype;
 
 // Initialize the WiFi and MQTT client object
 WiFiClient espClient;
@@ -96,15 +97,11 @@ ESP8266HTTPUpdateServer httpUpdater;
 bool isOtaUpdate = false;
 int otaTimeout = 600; // * 100ms
 
-#ifdef SHT31
 // Initialize SHT31 sensor
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
-#endif
 
-#ifdef HTU21
 // Initialize HTU21D sensor
 Adafruit_HTU21DF htu21 = Adafruit_HTU21DF();
-#endif
 
 // function prototypes
 bool readRtcMemory();
@@ -135,8 +132,8 @@ void setup()
 
 #ifdef MEASURE_BATTERY
     int sensorValue = analogRead(A0);
-    // Convert the analog reading (which goes from 0 - 1023) to a voltage (0 - 4.5V):
-    voltage = sensorValue * (4.2 / 1023.0);
+    // Convert the analog reading (which goes from 0 - 1023) to a voltage (0 - 4.2V):
+    voltage = sensorValue * (4.163 / 1023.0);
 
     Serial.print("Voltage is: ");
     Serial.print(voltage, 1);
@@ -150,6 +147,9 @@ void setup()
     // start OTA update modus if D3 is low
     if (digitalRead(D7) == LOW)
     {
+        memset(&rtcData, 0xff, sizeof(rtcData));
+        ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData));
+
         WiFi.softAP(otaSsid, otaPassword);
 
         MDNS.begin(otaHost);
@@ -167,22 +167,6 @@ void setup()
         return;
     }
 
-#ifdef SHT31
-    if (! sht31.begin(0x45)) {
-        Serial.println("Couldn't find SHT31");
-        blinkFailedAndSleep();
-    }
-#endif
-
-#ifdef HTU21
-    if (!htu21.begin()) {
-        Serial.println("Couldn't find HTU21");
-        blinkFailedAndSleep();
-    }
-#endif
-
-    getTemperatureAndHumidity();
-
     bool updateTemperature = false;
     bool updateHumidity = false;
     bool updateVoltage = false;
@@ -198,19 +182,16 @@ void setup()
     {
         rtcData.numStarts = 1;
         rtcData.lastUpdate = 1;
+        rtcData.sensorType = NONE;
         Serial.println("First start");
 
-        rtcData.lastUpdate = rtcData.numStarts;
 #ifdef MEASURE_TEMPERATURE
-        rtcData.temperature = temperature;
         updateTemperature = true;
 #endif
 #ifdef MEASURE_HUMIDITY
-        rtcData.humidity = humidity;
         updateHumidity = true;
 #endif
 #ifdef MEASURE_BATTERY
-        rtcData.voltage = voltage;
         updateVoltage = true;
 #endif
     }
@@ -221,20 +202,40 @@ void setup()
         Serial.print(maxUpdateInterval);
         Serial.println(" starts");
 
-        rtcData.lastUpdate = rtcData.numStarts;
 #ifdef MEASURE_TEMPERATURE
-        rtcData.temperature = temperature;
         updateTemperature = true;
 #endif
 #ifdef MEASURE_HUMIDITY
-        rtcData.humidity = humidity;
         updateHumidity = true;
 #endif
 #ifdef MEASURE_BATTERY
-        rtcData.voltage = voltage;
         updateVoltage = true;
 #endif
     }
+
+    if (rtcData.sensorType == SHT31) {
+        sht31.begin(0x45);
+    }
+    else if (rtcData.sensorType == HTU21) {
+        htu21.begin();
+    }
+    else {
+        if (sht31.begin(0x45)) {
+            Serial.println("Detected SHT31 sensor");
+            rtcData.sensorType = SHT31;
+        }
+        else if (htu21.begin()) {
+            Serial.println("Detected HTU21 sensor");
+            rtcData.sensorType = HTU21;
+        }
+        else {
+            Serial.println("No sensor detected");
+            rtcData.sensorType = NONE;
+            blinkFailedAndSleep();
+        }
+    }
+
+    getTemperatureAndHumidity();
 
 #ifdef MEASURE_TEMPERATURE
     if ((temperature < (rtcData.temperature - minTemperatureDifference)) || \
@@ -242,8 +243,6 @@ void setup()
     {
         Serial.println("temperature changed");
         updateTemperature = true;
-        rtcData.temperature = temperature;
-        rtcData.lastUpdate = rtcData.numStarts;
     }
 #endif
 
@@ -253,8 +252,6 @@ void setup()
     {
         Serial.println("humidity changed");
         updateHumidity = true;
-        rtcData.humidity = humidity;
-        rtcData.lastUpdate = rtcData.numStarts;
     }
 #endif
 
@@ -264,22 +261,20 @@ void setup()
     {
         Serial.println("voltage changed");
         updateVoltage = true;
-        rtcData.voltage = voltage;
-        rtcData.lastUpdate = rtcData.numStarts;
     }
 #endif
-
-    writeRtcMemory();
 
     if (updateTemperature || updateHumidity || updateVoltage)
     {
         if (! InitWiFi())
         {
+            writeRtcMemory();
             blinkFailedAndSleep();
         }
 
         if (!connectToMqttServer())
         {
+            writeRtcMemory();
             blinkFailedAndSleep();
         }
 
@@ -295,15 +290,30 @@ void setup()
 
         if (result) {
             mqttclient.loop();
+
+            if (updateTemperature)
+                rtcData.temperature = temperature;
+
+            if (updateHumidity)
+                rtcData.humidity = humidity;
+
+            if (updateVoltage)
+                rtcData.voltage = voltage;
+
+            rtcData.lastUpdate = rtcData.numStarts;
+
+            writeRtcMemory();
             blinkSuccessAndSleep();
         }
         else
         {
+            writeRtcMemory();
             blinkFailedAndSleep();
         }
     }
     else
     {
+        writeRtcMemory();
         blinkNoUpdateAndSleep();
     }
 
@@ -316,12 +326,25 @@ void loop()
         httpServer.handleClient();
         MDNS.update();
 
-        if (otaTimeout-- % 10 == 0) {
+        if (otaTimeout % 10 == 0) {
             Serial.printf("Going to sleep in %d seconds\n", otaTimeout/10);
-            digitalWrite(LED2_PIN, LOW);
-            delay(50);
-            digitalWrite(LED2_PIN, HIGH);
-            delay(50);
+        }
+
+        if (otaTimeout > 60) {
+            if (otaTimeout-- % 10 == 0) {
+                digitalWrite(LED2_PIN, LOW);
+                delay(50);
+                digitalWrite(LED2_PIN, HIGH);
+                delay(50);
+            }
+        }
+        else {
+            if (otaTimeout-- % 5 == 0) {
+                digitalWrite(LED2_PIN, LOW);
+                delay(50);
+                digitalWrite(LED2_PIN, HIGH);
+                delay(50);
+            }
         }
 
         if (otaTimeout <= 0) {
@@ -380,21 +403,21 @@ bool writeRtcMemory()
 bool getTemperatureAndHumidity()
 {
 #ifdef MEASURE_TEMPERATURE
-#ifdef SHT31
-    temperature = sht31.readTemperature();
-#endif
-#ifdef HTU21
-    temperature = htu21.readTemperature();
-#endif
+    if (rtcData.sensorType == SHT31) {
+        temperature = sht31.readTemperature();
+    }
+    else if (rtcData.sensorType == HTU21) {
+        temperature = htu21.readTemperature();
+    }
 #endif
 
 #ifdef MEASURE_HUMIDITY
-#ifdef SHT31
-    humidity = sht31.readHumidity();
-#endif
-#ifdef HTU21
-    humidity = htu21.readHumidity();
-#endif
+    if (rtcData.sensorType == SHT31) {
+        humidity = sht31.readHumidity();
+    }
+    else if (rtcData.sensorType == HTU21) {
+        humidity = htu21.readHumidity();
+    }
 #endif
 
     bool ret = true;
@@ -461,7 +484,7 @@ bool sendDataToServer(datatype which)
 
         case VOLTAGE:
             sprintf(feed, "%s%02x_%s", MQTT_USERNAME"/feeds/", mac[5], "voltage");
-            sprintf(attributes, "%01.1f", voltage);
+            sprintf(attributes, "%01.2f", voltage);
             Serial.print("Sending voltage to server ... ");
             break;
     }
