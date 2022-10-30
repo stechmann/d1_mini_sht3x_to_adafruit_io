@@ -1,14 +1,14 @@
+
 #include <Arduino.h>
 #include <SPI.h>
+#include <LittleFS.h>
+#include <SoftwareSerial.h>
+
 #include <NTPClient.h>
 #include <TimeLib.h>
+#include <Timezone.h>
+#include <RTClib.h>
 
-#define LED_PIN                 D4
-#define PWR_FOR_ANALOG_READ_PIN D5
-#define PWR_FOR_WIFI_PIN        D6
-#define LM75A_I2C_ADDRESS       0x48
-
-#include <Adafruit_HTU21DF.h>
 #include <Temperature_LM75_Derived.h>
 
 #include <ESP8266WiFi.h>
@@ -23,6 +23,17 @@
 #include <ESP8266HTTPUpdateServer.h>
 
 #include "credentials.h"
+
+#define I2C_SDA_PIN             D1
+#define I2C_SCL_PIN             D2
+#define ENERGY_METER_RX_PIN     D3
+#define ENERGY_METER_TX_PIN     D4
+#define LED_PIN                 D4
+#define PWR_FOR_ANALOG_READ_PIN D5
+#define PWR_FOR_WIFI_PIN        D6
+#define ENTER_OTA_UPDATE_PIN    D7
+
+#define LM75A_I2C_ADDRESS       0x48
 
 #define SERIAL_DEBUG
 #ifndef SERIAL_DEBUG
@@ -42,38 +53,38 @@ struct {
     uint32_t crc32;
 
     uint32_t dummydata;
-    uint32_t hour; // stores the hour of last wakeup
     uint32_t numStarts; // counts the number of starts
-    uint32_t lastUpdate; // contains the start number when the last update was sent
+    int32_t dailyForcedUpdateDone; // set to false at 0:00, set to true after successful push to server
     int32_t temperature1; // contains the temperature that was sent at the last update
     int32_t temperature2; // contains the temperature that was sent at the last update
     int32_t analogPinValue; // contains the analog pin value that was sent at the last update
-    byte data[512 - 8*4]; // nothing yet
+    byte data[512 - 7*4]; // nothing yet
 } rtcData;
 
 int32_t temperature1;
 int32_t temperature2;
 int32_t analogPinValue;
+float energy;
 
 const IPAddress google_host(8, 8, 8, 8); // for testing online status
-const float rtcCorrectionFactor = 1.05;
-unsigned int updateInterval = 3600 * rtcCorrectionFactor; // in seconds (1 hour)
 const int dailyUpdateAtXoclock = 6;
 const float minTemperatureDifference = 2; // only update server if newTemp > oldTemp +- diff
 const int32_t minAnalogPinValueDifference = 20;
 const int waitForApStartupTime = 80; // seconds
-const int pingTimeout = 10; // seconds
+const int pingTimeout = 50; // seconds
 uint8_t mac[6];
 
 typedef enum {
     TEMPERATURE1 = 1,
     TEMPERATURE2,
-    ANALOG_PIN_VALUE
+    ANALOG_PIN_VALUE,
+    ENERGY
 } datatype;
 
 // Initialize the WiFi and MQTT client object
 WiFiClient espClient;
 PubSubClient mqttclient(espClient);
+WiFiUDP ntpUDP;
 
 // required for OTA update
 const char* otaHost = "webupdate";
@@ -86,26 +97,55 @@ ESP8266HTTPUpdateServer httpUpdater;
 bool isOtaUpdate = false;
 int otaTimeout = 600; // * 100ms
 
-Adafruit_HTU21DF htu21;
+const char index_html_top[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html lang='de'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name= viewport content='width=device-width, initial-scale=1.0,' user-scalable=yes>
+    <style type='text/css'>
+        <!-- DIV.container { min-height: 10em; display: table-cell; vertical-align: middle }.button {height:35px; width:90px; font-size:16px} -->
+        body {background-color: white;}
+    </style>
+</head>
+<body>
+<pre>
+    <center>
+        <h2>ESP 8266 LittleFS</h2>
+    </center>
+)rawliteral";
+
+// Sensors
 Generic_LM75 lm75a;
 
+// RTC
+RTC_DS3231 rtc;
 
 #define NTP_SERVER "de.pool.ntp.org"
-#define GMT_TIME_ZONE +1
-WiFiUDP ntpUDP;
-// You can specify the time server pool and the offset, (in seconds)
-// additionaly you can specify the update interval (in milliseconds).
-NTPClient timeClient(ntpUDP, NTP_SERVER, GMT_TIME_ZONE * 3600 , 60000);
+NTPClient timeClient(ntpUDP, NTP_SERVER);
 
+TimeChangeRule summertime = {"CEST", Last, Sun, Mar, 2, 120}; //Daylight time = UTC + 2 hours
+TimeChangeRule wintertime = {"CET", Last, Sun, Oct, 3, 60}; //Standard time = UTC + 1 hours
+Timezone myTZ(summertime, wintertime);
+TimeChangeRule *tcr;        //pointer to the time change rule, use to get TZ abbrev
+
+SoftwareSerial swSer;
 
 // function prototypes
 bool readRtcMemory();
 bool writeRtcMemory();
+bool syncTime();
+String prettyTime();
 bool getTemperature();
+bool getEnergy();
+bool saveEnergyToFilesystem();
 bool sendDataToServer(datatype which);
 bool initWiFi();
 bool pingHost(IPAddress host);
 bool connectToMqttServer();
+void startOtaUpdateModus();
+void handleRoot();
+bool handleFileRead(String path);
 int roundTo5(int in);
 void shortBlink();
 void blinkSuccessAndSleep();
@@ -117,6 +157,7 @@ void setup()
     bool updateTemperature1 = false;
     bool updateTemperature2 = false;
     bool updateAnalogPinValue = false;
+    bool updateEnergy = false;
 
     WiFi.disconnect(true);
 
@@ -127,87 +168,77 @@ void setup()
     pinMode(PWR_FOR_ANALOG_READ_PIN, OUTPUT); // enable output
     pinMode(PWR_FOR_WIFI_PIN, INPUT); // it is configured as input by default. it is pulled down by external resistor
     pinMode(D0, WAKEUP_PULLUP); // reset after deep sleep
-    pinMode(D7, INPUT_PULLUP); // if low during boot -> ota update
+    pinMode(ENTER_OTA_UPDATE_PIN, INPUT_PULLUP); // if low during boot -> ota update
+
+    swSer.begin(300, SWSERIAL_7E1, ENERGY_METER_RX_PIN, ENERGY_METER_TX_PIN);
+    swSer.setTimeout(2500);
 
     Serial.begin(115200);
-    delay(100);
+    delay(500);
     Serial.println();
 
-    // start OTA update modus if D3 is low
-    if (digitalRead(D7) == LOW)
+    // start OTA update modus if ENTER_OTA_UPDATE_PIN is low
+    if (digitalRead(ENTER_OTA_UPDATE_PIN) == LOW)
     {
-        memset(&rtcData, 0xff, sizeof(rtcData));
-        ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData));
-
-        WiFi.softAP(otaSsid, otaPassword);
-
-        MDNS.begin(otaHost);
-
-        httpUpdater.setup(&httpServer);
-        httpServer.begin();
-
-        MDNS.addService("http", "tcp", 80);
-        Serial.println("HTTPUpdateServer ready!");
-        Serial.printf("Connect to Wifi %s, password %s and\n", otaSsid, otaPassword);
-        Serial.printf("open http://%s.local/update in your browser\n", otaHost);
-
-        isOtaUpdate = true;
-
+        startOtaUpdateModus();
         return;
     }
+
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // read time from external RTC
+    if (!rtc.begin()) {
+        Serial.println("Couldn't find RTC");
+    }
+    rtc.clearAlarm(1); // assume we were woken up by RTC alarm -> disable alarm
+
+    time_t utc = rtc.now().unixtime();
+    setTime(myTZ.toLocal(utc, &tcr));
+    Serial.print("Start at ");
+    Serial.println(prettyTime());
 
     if (readRtcMemory()) // CRC of rtcData is valid
     {
         rtcData.numStarts++;
-        if (rtcData.hour == 26) // not set via internet yet
-        {}
-        else if (rtcData.hour < 23)
-        {
-            rtcData.hour++;
-        }
-        else
-        {
-            rtcData.hour = 0;
-        }
 
         Serial.print("Started ");
         Serial.print(rtcData.numStarts);
         Serial.println(" times");
-
-        Serial.print("It is something around ");
-        Serial.print(rtcData.hour);
-        Serial.println(":00 o'clock");
     }
     else // CRC of rtcData is invalid
     {
         rtcData.numStarts = 1;
-        rtcData.lastUpdate = 1;
-        rtcData.hour = 26; // initialize to illegal value to be able to check if was set via internet at all
+        rtcData.dailyForcedUpdateDone = false;
         Serial.println("First start");
 
+        // initialize external RTC at first start
+        rtc.disable32K();
+
+        DateTime alarmTime(2022, 01, 01, 0, 0, 0);
+        rtc.writeSqwPinMode(DS3231_OFF);
+        rtc.clearAlarm(1);
+        rtc.clearAlarm(2);
+        rtc.setAlarm1(alarmTime, DS3231_A1_Minute); /* Alarm when minutes and seconds match */
+        rtc.disableAlarm(2);
+
         updateTemperature1 = true;
         updateTemperature2 = true;
         updateAnalogPinValue = true;
     }
-
-    if (rtcData.hour == dailyUpdateAtXoclock)
-    {
-        Serial.print("forcing daily update");
-
-        updateTemperature1 = true;
-        updateTemperature2 = true;
-        updateAnalogPinValue = true;
-    }
-
-    Wire.begin(D1, D2);
 
     getTemperature();
 
+    Serial.print("Reading analog pin value ... ");
     digitalWrite(PWR_FOR_ANALOG_READ_PIN, HIGH);
     delay(500);
     analogPinValue = roundTo5(analogRead(A0));
+    analogPinValue = (analogPinValue >= 20) ? analogPinValue : 0;
     delay(200);
     digitalWrite(PWR_FOR_ANALOG_READ_PIN, LOW);
+    Serial.println("[DONE]");
+
+    Serial.print("Analog pin value is: ");
+    Serial.println(analogPinValue);
 
     if ((temperature1 <= (rtcData.temperature1 - minTemperatureDifference)) || \
         (temperature1 >= (rtcData.temperature1 + minTemperatureDifference)))
@@ -242,7 +273,25 @@ void setup()
         updateAnalogPinValue = true;
     }
 
-    if (updateTemperature1 || updateTemperature2 || updateAnalogPinValue)
+    if (hour() < dailyUpdateAtXoclock)
+    {
+        rtcData.dailyForcedUpdateDone = false;
+    }
+
+    if (rtcData.numStarts == 1 || (hour() >= dailyUpdateAtXoclock && !rtcData.dailyForcedUpdateDone))
+    {
+        updateTemperature1 = true;
+        updateTemperature2 = true;
+        updateAnalogPinValue = true;
+        updateEnergy = true;
+
+        if (getEnergy())
+        {
+            saveEnergyToFilesystem();
+        }
+    }
+
+    if (updateTemperature1 || updateTemperature2 || updateAnalogPinValue || updateEnergy || rtc.lostPower())
     {
         if (! initWiFi())
         {
@@ -256,58 +305,6 @@ void setup()
             blinkFailedAndSleep();
         }
 
-        // connecting to wifi takes some time. substract this from sleep time
-        updateInterval = updateInterval - waitForApStartupTime;
-
-        /* calibrate time with ntp-time once per day and at first startup */
-        if (rtcData.hour == 26 || rtcData.hour == dailyUpdateAtXoclock)
-        {
-            timeClient.begin();
-            if (! timeClient.update())
-                goto ntpNotUpdated;
-            timeClient.end();
-
-            Serial.print("Internet Time: ");
-            Serial.println(timeClient.getFormattedTime());
-
-            setTime(timeClient.getEpochTime());
-
-            // simple adjustment for daylight saving time
-            if ((month() > 3) && (month() < 11))
-            {
-                adjustTime(+3600);
-            }
-
-            TimeElements tm;
-
-            tm.Year = year() - 1970;
-            tm.Month = month();
-            tm.Day = day();
-            tm.Minute = 0;
-            tm.Second = 0;
-
-            tm.Hour = hour() + 1;
-            rtcData.hour = hour();
-
-            // if we woke up at 5:5x, next check is at 7:00
-            if ((hour() == dailyUpdateAtXoclock-1) && (minute() > 50))
-            {
-                tm.Hour += 1;
-                rtcData.hour += 1;
-            }
-
-            if (tm.Hour == 24)
-            {
-                tm.Hour = 0;
-                tm.Day += 1;
-            }
-
-            // sleep until next full hour
-            updateInterval = ((makeTime(tm) - now()) * rtcCorrectionFactor) + 180;
-            rtcData.hour = hour();
-        }
-
-ntpNotUpdated:
         if (!connectToMqttServer())
         {
             writeRtcMemory();
@@ -315,7 +312,8 @@ ntpNotUpdated:
         }
 
         bool result = true;
-        if (updateTemperature1) {
+        if (updateTemperature1)
+        {
             if (sendDataToServer(TEMPERATURE1)) {
                 rtcData.temperature1 = temperature1;
             }
@@ -324,22 +322,18 @@ ntpNotUpdated:
             }
         }
 
-        if (updateTemperature2) {
-            if (updateTemperature1) {
-                delay(500); // do not publish one after each other too fast
-            }
+        if (updateTemperature2)
+        {
             if (sendDataToServer(TEMPERATURE2)) {
                 rtcData.temperature2 = temperature2;
-             }
+            }
             else {
                 result = false;
             }
         }
 
-        if (updateAnalogPinValue) {
-            if (updateTemperature1 || updateTemperature2) {
-                delay(500); // do not publish one after each other too fast
-            }
+        if (updateAnalogPinValue)
+        {
             if (sendDataToServer(ANALOG_PIN_VALUE)) {
                 rtcData.analogPinValue = analogPinValue;
             }
@@ -348,9 +342,28 @@ ntpNotUpdated:
             }
         }
 
-        if (result) {
-            rtcData.lastUpdate = rtcData.numStarts;
+        if (updateEnergy)
+        {
+            if (!sendDataToServer(ENERGY)) {
+                result = false;
+            }
+        }
 
+        // sync time at first start, when RTC is not set and on first of each month
+        if (rtcData.numStarts == 1 || rtc.lostPower() ||
+            ((day() == 1) && (hour() == dailyUpdateAtXoclock)))
+        {
+            if (!syncTime())
+            {
+                result = false;
+            }
+        }
+
+        if (result) {
+            if (hour() >= dailyUpdateAtXoclock)
+            {
+                rtcData.dailyForcedUpdateDone = true;
+            }
             writeRtcMemory();
             blinkSuccessAndSleep();
         }
@@ -371,36 +384,42 @@ ntpNotUpdated:
 
 void loop()
 {
-    if (isOtaUpdate) {
+    if (isOtaUpdate)
+    {
+        static unsigned long previousMillis;
+        if (millis() - previousMillis >= 100)
+        {
+            if (otaTimeout % 10 == 0) {
+                Serial.printf("Reboot in %d seconds\n", otaTimeout/10);
+            }
+
+            if (otaTimeout > 60) {
+                if (otaTimeout-- % 10 == 0) {
+                    digitalWrite(LED_PIN, LOW);
+                    delay(50);
+                    digitalWrite(LED_PIN, HIGH);
+                    delay(50);
+                }
+            }
+            else {
+                if (otaTimeout-- % 5 == 0) {
+                    digitalWrite(LED_PIN, LOW);
+                    delay(50);
+                    digitalWrite(LED_PIN, HIGH);
+                    delay(50);
+                }
+            }
+
+            if (otaTimeout <= 0) {
+                ESP.restart();
+            }
+
+            previousMillis = millis();
+        }
+
         httpServer.handleClient();
         MDNS.update();
-
-        if (otaTimeout % 10 == 0) {
-            Serial.printf("Reboot in %d seconds\n", otaTimeout/10);
-        }
-
-        if (otaTimeout > 60) {
-            if (otaTimeout-- % 10 == 0) {
-                digitalWrite(LED_PIN, LOW);
-                delay(50);
-                digitalWrite(LED_PIN, HIGH);
-                delay(50);
-            }
-        }
-        else {
-            if (otaTimeout-- % 5 == 0) {
-                digitalWrite(LED_PIN, LOW);
-                delay(50);
-                digitalWrite(LED_PIN, HIGH);
-                delay(50);
-            }
-        }
-
-        if (otaTimeout <= 0) {
-            ESP.deepSleep(1e6); // blinkNoUpdateAndSleep();
-        }
-
-        delay(100);
+        delay(1);
     }
 }
 
@@ -452,31 +471,49 @@ bool writeRtcMemory()
     return false;
 }
 
-bool getTemperature()
+bool syncTime(void)
 {
-    float readTemp1;
-    htu21.begin();
-    delay(200);
+    bool ret = false;
+    Serial.print("Syncing time with NTP server ... ");
 
-    readTemp1 = htu21.readTemperature();
-
-    // in case of i2c error (readTemperature() return 0.0), try again
-    if (readTemp1 == 0.0f)
+    timeClient.begin();
+    if (timeClient.update())
     {
-        delay(100);
-        readTemp1 = htu21.readTemperature();
+        rtc.adjust(DateTime(timeClient.getEpochTime()));
+        setTime(timeClient.getEpochTime());
+
+        Serial.println("[DONE]");
+        ret = true;
+    }
+    else
+    {
+        Serial.println("[FAILED]");
     }
 
-    temperature1 = readTemp1;
+    return ret;
+}
+
+String prettyTime()
+{
+    char datebuffer[11], timebuffer[9];
+    sprintf(datebuffer, "%02d.%02d.%04d", day(), month(), year());
+    sprintf(timebuffer, "%02d:%02d:%02d", hour(), minute(), second());
+
+    return String(datebuffer) + "-" + String(timebuffer);
+}
+
+bool getTemperature()
+{
+    bool ret = true;
+
+    Serial.print("Collecting temperature data ... ");
+
+    temperature1 = rtc.getTemperature() - 1; // measured offset
 
     lm75a.disableShutdownMode();
     delay(200);
     temperature2 = lm75a.readTemperatureC();
     lm75a.enableShutdownMode();
-
-    bool ret = true;
-
-    Serial.print("Collecting temperature data ... ");
 
     if (isnan(temperature1)) {  // check if 'is not a number'
         ret = false;
@@ -506,6 +543,100 @@ bool getTemperature()
     return ret;
 }
 
+bool getEnergy()
+{
+// Interface zum Itron ACE3000 Type 260 Stromzähler
+// https://wiki.volkszaehler.org/hardware/channels/meters/power/edl-ehz/itron_ace3000_type_260
+// 300 Baud/s @ 7E1 = 34ms per character -> ~3.8 seconds for full response
+/*
+    example response (112 bytes):
+    ^C^Z/?!
+    /ACE0\3k260V01.18
+    ^BF.F(00)
+    C.1(1234567890123456)
+    C.5.0(00)
+    1.8.0(000285.4*kWh) <--- Verbrauch
+    2.8.0(000120.1*kWh) <--- Einspeisung
+    !
+*/
+    char receiveBuffer[128] = {0};
+    bool ret = false;
+
+    Serial.print("Collecting energy data ... ");
+
+    //write "/?!"+CR+LF to init D0-Mode of the Itron ACE3000
+    swSer.println(PSTR("/?!"));
+    delay(200); // wait some time until response is available
+
+    if (swSer.readBytes(receiveBuffer, sizeof(receiveBuffer) - 1) > 0)
+    {
+        if (char *pos = strstr(receiveBuffer, "1.8.0"))
+        {
+            pos += 6;
+            energy = atof(pos);
+            if (energy > 0)
+            {
+                ret = true;
+            }
+        }
+    }
+
+//    digitalWrite(LED_PIN, HIGH); //disable LED (pin is used by swSer)
+
+    if (ret == true)
+    {
+        Serial.println("[DONE]");
+    }
+    else
+    {
+        Serial.println("[FAILED]");
+    }
+
+    // for debugging
+//    Serial.println();
+//    Serial.print(receiveBuffer);
+//    Serial.println();
+
+    Serial.print("Current energy count is: ");
+    Serial.print(energy, 1);
+    Serial.println("kWh");
+    Serial.println();
+
+    return ret;
+}
+
+bool saveEnergyToFilesystem()
+{
+    Serial.print("Writing energy data to LittleFS... ");
+
+    if(!LittleFS.begin())
+    {
+        Serial.println("[FAILED]: An Error has occurred while mounting LittleFS");
+
+        return false;
+    }
+
+    File file = LittleFS.open("/energy.txt", "a");
+    if(!file)
+    {
+        Serial.println("[FAILED]: Failed to open file for appending");
+        return false;
+    }
+
+    // file entry is dd.mm.yyyy-hh:mm:ss,vvvvvv.v
+    char textBuffer[32] = {0};
+    sprintf(textBuffer, prettyTime().c_str());
+    textBuffer[19] = ',';
+    sprintf(&textBuffer[20], "%08.1f", energy);
+
+    file.println(textBuffer);
+    file.close();
+    LittleFS.end();
+
+    Serial.println("[DONE]");
+    return true;
+}
+
 bool sendDataToServer(datatype which)
 {
     bool ret = false;
@@ -532,6 +663,12 @@ bool sendDataToServer(datatype which)
             sprintf(feed, "%s%02x_%s", MQTT_USERNAME"/feeds/", mac[5], "analog");
             sprintf(attributes, "%04d", analogPinValue);
             Serial.print("Sending analog pin value to server ... ");
+            break;
+
+        case ENERGY:
+            sprintf(feed, "%s%02x_%s", MQTT_USERNAME"/feeds/", mac[5], "energy");
+            sprintf(attributes, "%06.1f", energy);
+            Serial.print("Sending energy value to server ... ");
             break;
     }
     // Send payload
@@ -651,6 +788,98 @@ bool connectToMqttServer()
     return ret;
 }
 
+void startOtaUpdateModus()
+{
+    memset(&rtcData, 0xff, sizeof(rtcData));
+    ESP.rtcUserMemoryWrite(0, (uint32_t*) &rtcData, sizeof(rtcData));
+
+    WiFi.softAP(otaSsid, otaPassword);
+
+    MDNS.begin(otaHost);
+
+    httpUpdater.setup(&httpServer);
+    httpServer.begin();
+    httpServer.on("/", handleRoot);
+    httpServer.onNotFound([]() { // If the client requests any URI
+        if (!handleFileRead(httpServer.uri())) // send it if it exists
+            httpServer.send(404, "text/plain", "404: Not Found"); // otherwise, respond with a 404 (Not Found) error
+    });
+
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("HTTPUpdateServer ready!");
+    Serial.printf("Connect to Wifi %s, password %s and\n", otaSsid, otaPassword);
+    Serial.printf("open http://%s.local/update in your browser\n", otaHost);
+
+    isOtaUpdate = true;
+}
+
+String getContentType(String filename)
+{
+    if(filename.endsWith(".htm")) return "text/html";
+    else if(filename.endsWith(".html")) return "text/html";
+    else if(filename.endsWith(".css")) return "text/css";
+    else if(filename.endsWith(".jpg")) return "image/jpeg";
+    return "text/plain";
+}
+
+bool handleFileRead(String path)
+{
+    Serial.println("handleFileRead: " + path);
+
+    if (path.endsWith("/")) path += "index.html"; // If a folder is requested, send the index file
+    String contentType = getContentType(path);
+
+    if(LittleFS.begin())
+    {
+        if (LittleFS.exists(path))
+        {
+            File file = LittleFS.open(path, "r");
+            httpServer.streamFile(file, contentType);
+
+            file.close();
+            return true;
+        }
+
+        Serial.println("\tFile Not Found");
+        return false;
+    }
+
+    Serial.println(F("An Error has occurred while mounting LittleFS"));
+    return false;
+}
+
+void handleRoot()
+{
+    FSInfo fs_info;
+    LittleFS.info(fs_info);
+    String buffer;
+    buffer = FPSTR(index_html_top);
+
+    if (!LittleFS.begin())
+    {
+        Serial.println(F("An Error has occurred while mounting LittleFS"));
+    }
+
+    Dir dir = LittleFS.openDir("/");
+
+    while (dir.next())
+    {
+        buffer += "<a href ='" + dir.fileName() + "'>";
+        buffer += dir.fileName() + "</a> " + String(dir.fileSize()) + " Bytes<br>\r\n";
+    }
+
+    buffer += "<br><br>Filesystem info:<br>";
+    buffer += "================<br>";
+    buffer += "totalBytes: " + String(fs_info.totalBytes) + "<br>";
+    buffer += "usedBytes: " + String(fs_info.usedBytes) + "<br>";
+    buffer += "blockSize: " + String(fs_info.blockSize) + "<br>";
+    buffer += "pageSize: " + String(fs_info.pageSize) + "<br>";
+    buffer += "maxOpenFiles: " + String(fs_info.maxOpenFiles) + "<br>";
+    buffer += "maxPathLength: " + String(fs_info.maxPathLength) + "<br>";
+    buffer += "</pre></body></html>\r\n";
+    httpServer.send(200, "text/html", buffer);
+}
+
 int roundTo5(int in)
 {
     const signed char round5delta[5] = {0, -1, -2, 2, 1};  // difference to the "rounded to nearest 5" value
@@ -660,21 +889,16 @@ int roundTo5(int in)
 // pattern ".."
 void shortBlink()
 {
-#ifdef SERIAL_DEBUG
     digitalWrite(LED_PIN, LOW);
     delay(50);
     digitalWrite(LED_PIN, HIGH);
     delay(50);
-#endif
 }
 
 // pattern "- -"
 void blinkSuccessAndSleep()
 {
-    Serial.print("Sleep for ");
-    Serial.print(updateInterval);
-    Serial.println(" seconds ...");
-#ifdef SERIAL_DEBUG
+    Serial.print("[DEEP.SLEEP]");
     digitalWrite(LED_PIN, LOW);
     delay(500);
     digitalWrite(LED_PIN, HIGH);
@@ -682,19 +906,15 @@ void blinkSuccessAndSleep()
     digitalWrite(LED_PIN, LOW);
     delay(500);
     digitalWrite(LED_PIN, HIGH);
-#endif
-    // sleep for x seconds
-    ESP.deepSleep(updateInterval * 1e6);
+
+    ESP.deepSleep(0);
     delay(100);
 }
 
 // pattern "- ..."
 void blinkFailedAndSleep()
 {
-    Serial.print("Sleep for ");
-    Serial.print(updateInterval);
-    Serial.println(" seconds ...");
-#ifdef SERIAL_DEBUG
+    Serial.print("[DEEP.SLEEP]");
     digitalWrite(LED_PIN, LOW);
     delay(500);
     digitalWrite(LED_PIN, HIGH);
@@ -710,18 +930,15 @@ void blinkFailedAndSleep()
     digitalWrite(LED_PIN, LOW);
     delay(50);
     digitalWrite(LED_PIN, HIGH);  // sleep for x seconds
-#endif
-    ESP.deepSleep(updateInterval * 1e6);
+
+    ESP.deepSleep(0);
     delay(100);
 }
 
 // pattern ".."
 void blinkNoUpdateAndSleep()
 {
-    Serial.print("Sleep for ");
-    Serial.print(updateInterval);
-    Serial.println(" seconds ...");
-#ifdef SERIAL_DEBUG
+    Serial.print("[DEEP.SLEEP]");
     digitalWrite(LED_PIN, LOW);
     delay(50);
     digitalWrite(LED_PIN, HIGH);
@@ -729,7 +946,7 @@ void blinkNoUpdateAndSleep()
     digitalWrite(LED_PIN, LOW);
     delay(50);
     digitalWrite(LED_PIN, HIGH);
-#endif
-    ESP.deepSleep(updateInterval * 1e6);
+
+    ESP.deepSleep(0);
     delay(100);
 }
